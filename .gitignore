@@ -1,0 +1,32 @@
+# Local environments and build products
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+.coverage
+
+# Credentials and private research
+.env
+.env.*
+!.env.example
+/data/
+/artifacts/
+/backups/
+/diagnostics/
+/captures/
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.pdf
+*.zip
+*.bak
+*.log
+*.jsonl
+*_response.json
+
+.DS_Store
+Thumbs.db
