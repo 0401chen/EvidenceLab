@@ -44,9 +44,27 @@ Linux/macOS 可使用 `.venv/bin/python` 执行相同命令。`requirements.txt`
 
 无模型也能载入原创合成样例，完成证据查看、候选审阅、条件比较和报告导出，见[操作手册](docs/DEMO_RUNBOOK.md)。
 
+## 统一比赛演示（8792）
+
+先将已有、经过原文与 SHA256 核查的研究库备份恢复到一个**新的数据目录**。源码不附带真实论文或研究数据。演示脚本拒绝缺失或空白数据库，不会建立空库替代你的研究记录。
+
+```powershell
+.\START_DEMO_AI.ps1 -Python .\.venv\Scripts\python.exe -ConfigFile C:\private\evidencelab.env -DataDir .\artifacts\demo-data
+```
+
+本机已有配置文件可通过 `EVIDENCELAB_CONFIG_FILE` 指定；文件只在后端进程内读取，不复制到源码。配置包括 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，可选 `LLM_TIMEOUT=90`。缺少必需项时列出变量名并保留本地模式。也可在未指定配置文件时使用进程环境变量。`EVIDENCELAB_PYTHON` 可指向已有 Python 环境。
+
+打开 `http://127.0.0.1:8792`，无需切换地址即可查看 PDF、问答、核验、人工实验、条件比较及报告。配置模型后，问答和核验默认选择模型模式；只有主动点击发送才调用模型，加载页面、读取状态与切换菜单不会自动付费。可手动选择本地模式。来源校验、超时、网络错误处理、有限纠错和停止等待操作保留。停止等待不保证服务商立刻中止已经开始的计算或计费。
+
+离线备用：停止已知且空闲的 8792 服务后，执行 `START_DEMO.ps1`（同样可传 `-Python` / `-DataDir`）。它对同一数据副本禁用模型网络。两个脚本均不自动停止占用端口的服务。
+
+可选 `-AuditDir .\artifacts\acceptance-session` 用于私有验收采集，逐次记录用量、正文和结果，不设置人为调用/字符/费用上限，也不自动重试；必须使用新的目录，禁止上传这些材料。费用仅对已知费率的配置模型估算，最终以服务商账单为准。正常演示不需要该参数。
+
+五分钟点击路线与讲稿见 [正式比赛演示](docs/COMPETITION_DEMO.md)。工程与真实验收记录见 [本轮整理记录](docs/UNIFIED_DEMO_ACCEPTANCE.md)。复杂表格与多条件问答仍可能失败，不能把两条文本案例成功推广为全部科研任务可靠。
+
 ## 配置和数据
 
-需要模型功能时，将 `.env.example` 复制为本机 `.env`，填写 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。密钥只由后端读取；不要上传 `.env`。模型请求可能产生服务商费用，并会向配置服务发送所选原文。本公开候选制作过程没有调用模型。
+需要模型功能时，将 `.env.example` 复制为本机 `.env`，填写 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。密钥只由后端读取；不要上传 `.env`。模型请求可能产生服务商费用，并会向配置服务发送所选原文。真实调用结果与失败必须按本次请求记录，不能用旧响应冒充新成功。
 
 默认使用本项目 `data/`。移动项目时一起保留数据库和 `data/files`，路径解析仍限制在数据目录内。备份用法：
 

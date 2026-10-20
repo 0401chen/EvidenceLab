@@ -11,7 +11,7 @@ from backend.app.errors import ProviderError
 
 
 # Archived V1 protocol fixtures remain explicit; production defaults to V2.
-CONFIG = {"model": "offline-test-model", "base_url": "http://offline.invalid/v1", "task_protocol": "legacy"}
+CONFIG = {"model": "offline-test-model", "base_url": "http://offline.invalid/v1"}
 
 
 def test_chinese_answer_selects_english_source_without_copying_long_ids(monkeypatch, evidence_factory):

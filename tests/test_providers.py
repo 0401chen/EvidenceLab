@@ -11,7 +11,7 @@ from backend.app.errors import ProviderError
 
 
 # The original response fixtures explicitly exercise the V1 compatibility path.
-CONFIG = {"model": "offline-test-model", "base_url": "http://offline.invalid/v1", "enrich_metadata": False, "task_protocol": "legacy"}
+CONFIG = {"model": "offline-test-model", "base_url": "http://offline.invalid/v1", "enrich_metadata": False}
 
 
 def mock_json(monkeypatch, result):

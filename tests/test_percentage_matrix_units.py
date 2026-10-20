@@ -1,11 +1,9 @@
 """Explicit table-wide units must keep benchmark columns and primary cells."""
-from copy import deepcopy
 
 import pytest
 
 from backend.app import providers
-from backend.app.research_tasks import table_cells, task_fragments
-from backend.app.task_contract import check_findings
+from backend.app.evidence_cells import table_cells, source_fragments
 
 
 def fixture(caption="Table 2. Classification accuracy (%) on two benchmarks.", cell="73 ± 0.4"):
@@ -67,7 +65,7 @@ def test_ambiguous_duplicate_benchmark_columns_do_not_select_a_cell():
 @pytest.mark.parametrize("unit", ["s", "sec", "ms"])
 def test_explicit_time_annotation_keeps_center_separate_and_does_not_infer_its_role(unit):
     item, evidence = fixture(cell=f"73 (0.4 {unit})")
-    _, fragments = task_fragments(evidence)
+    _, fragments = source_fragments(evidence)
     cells = table_cells(evidence, fragments)
     selected = next(cell for cell in cells.values() if cell["column_label"] == "Bench-Q")
     assert selected["value"] == "73"
@@ -78,25 +76,11 @@ def test_explicit_time_annotation_keeps_center_separate_and_does_not_infer_its_r
     assert not providers._unit_matches_measurement(item, evidence)
     item["value"], item["dataset"] = "73", "Bench-R"
     assert not providers._unit_matches_measurement(item, evidence)
-    row_handle = selected["row_handles"][0]
-    caption_handle = next(handle for handle, binding in fragments.items()
-                          if binding["source"]["id"] == "caption" and "accuracy" in binding["quote"])
-    def field(text, handle=row_handle):
-        return {"text": text, "evidence": [{"handle": handle}]}
-    raw = {"items": [{"requirement_id": "R1", "observations": [{"fields": {
-        "subject": field("Atlas-A"), "metric": field("accuracy", caption_handle), "value": field("73"),
-        "dataset": field("Bench-Q")}, "binding": {"kind": "table_cell", "cell_id": selected["cell_id"]}}], "missing_fields": []}]}
-    requirements = [{"id": "R1", "request": "Atlas-A结果", "subject": "Atlas-A", "mode": "qa",
-                     "fields": ["subject", "metric", "value", "dataset"], "expected": {}}]
-    assert check_findings(raw, requirements, evidence, fragments, cells)["coverage"]["source_complete"] is True
-    changed = deepcopy(raw)
-    changed["items"][0]["observations"][0]["fields"]["value"]["text"] = "0.4"
-    assert check_findings(changed, requirements, evidence, fragments, cells)["observations"][0]["status"] == "withheld"
 
 
 def test_unitless_parenthetical_pair_remains_unresolved():
     _, evidence = fixture(cell="73 (0.4)")
-    _, fragments = task_fragments(evidence)
+    _, fragments = source_fragments(evidence)
     assert all(cell["column_label"] != "Bench-Q" for cell in table_cells(evidence, fragments).values())
 
 

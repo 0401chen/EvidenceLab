@@ -42,7 +42,7 @@ class ScopeRequest(BaseModel):
 
 class QARequest(ScopeRequest):
     question: str = Field(min_length=1, max_length=4000)
-    engine: Literal["local", "llm", "llm_tasks"] = "local"
+    engine: Literal["local", "llm"] = "local"
 
     @field_validator("question")
     @classmethod
@@ -54,7 +54,7 @@ class QARequest(ScopeRequest):
 
 class VerifyRequest(ScopeRequest):
     claim: str = Field(min_length=1, max_length=4000)
-    engine: Literal["local", "llm", "llm_tasks"] = "local"
+    engine: Literal["local", "llm"] = "local"
 
     @field_validator("claim")
     @classmethod
@@ -632,15 +632,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if body.engine == "local":
             return grounded(await run_in_threadpool(answer_local, body.question, evidence), evidence)
         require_llm()
-        if body.engine in {"llm", "llm_tasks"}:
-            task_config = {**cfg.provider_config(), "task_protocol": "legacy" if body.engine == "llm" else "structured"}
+        if body.engine == "llm":
+            task_config = cfg.provider_config()
             result = grounded(await provider_call(answer_llm, body.question, evidence, task_config), evidence)
-            if result.get("task_protocol") == "requirements_observations_v1":
-                # The task/evidence stages already have distinct inputs. Do
-                # not ask the same model to rubber-stamp its rendered answer.
-                result.setdefault("warnings", []).append("本次未另行调用模型作独立语义认证；请核对任务清单、每条观察及原文。")
-                result["mode"] = "llm_tasks"
-                return result
             if result.get("citations") and result.get("verdict") != "insufficient":
                 try:
                     assertions = result.get("assertion_evidence", [])
@@ -651,7 +645,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                     # this to the answer's chosen rows discards table headers,
                     # captions and counter-evidence and repeats the same error.
                     check = grounded(await provider_call(verify_claim, claim_text or result["answer"], evidence,
-                                                         {**cfg.provider_config(), "task_protocol": "legacy"}), evidence)
+                                                         cfg.provider_config()), evidence)
                 except HTTPException as exc:
                     # Retain the already grounded answer when only the separate
                     # semantic check fails; its uncertainty must remain visible.
@@ -677,12 +671,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         from .providers import verify_claim
         ids = scope(body.paper_ids)
         evidence = store.evidence_for(ids)
-        if body.engine in {"llm", "llm_tasks"}:
+        if body.engine == "llm":
             require_llm()
-        task_config = {**cfg.provider_config(), "task_protocol": "legacy" if body.engine == "llm" else "structured"} if body.engine in {"llm", "llm_tasks"} else None
+        task_config = cfg.provider_config() if body.engine == "llm" else None
         result = grounded(await provider_call(verify_claim, body.claim, evidence, task_config), evidence)
-        if body.engine == "llm_tasks":
-            result["mode"] = "llm_tasks"
         return result
 
     @app.post("/api/compare")

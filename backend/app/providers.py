@@ -340,11 +340,6 @@ def _checked_verdict(result: dict, candidates: list[dict], fragments: dict | Non
 
 
 async def answer_llm(question: str, evidence: list[dict], config: dict) -> dict:
-    if config.get("task_protocol") != "legacy":
-        from .research_tasks import run_research_task
-        return await run_research_task(question, evidence, config, "qa")
-    # Explicit compatibility seam for archived response replays/integrations.
-    # The product configuration never selects this former answer protocol.
     config = _config(config)
     start = perf_counter()
     candidates, retrieval = select_evidence_context(question, evidence)
@@ -501,8 +496,8 @@ def _unit_matches_measurement(item: dict, evidence: list[dict] | None = None) ->
         requested_metric = requested[0] if requested else _canonical_metric(str(item.get("metric") or ""))
         if not caption_info or requested_metric != caption_info[0]:
             continue
-        from .research_tasks import table_cells, task_fragments
-        _, fragments = task_fragments([source, *captions])
+        from .evidence_cells import table_cells, source_fragments
+        _, fragments = source_fragments([source, *captions])
         matches = [cell for cell in table_cells([source, *captions], fragments).values()
                    if identity(cell["row_label"]) == identity(item["method"])
                    and identity(cell["column_label"]) == identity(item["dataset"])
@@ -1110,9 +1105,6 @@ task 是原文直接报告的研究任务；未报告则 null。单位引文须�
 
 
 async def verify_claim(claim: str, evidence: list[dict], config: dict | None) -> dict:
-    if config and config.get("model") and config.get("task_protocol") != "legacy":
-        from .research_tasks import run_research_task
-        return await run_research_task(claim, evidence, config, "verify")
     start = perf_counter()
     candidates, retrieval = select_evidence_context(claim, evidence)
     if not config or not config.get("model"):

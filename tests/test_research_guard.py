@@ -48,7 +48,7 @@ def test_wrong_numeric_answer_is_withheld_without_protocol_retry(monkeypatch, ev
         return {"assertions": [{"text": "AlphaNet-3 的错误率为88%。", "evidence": [{"handle": "F1"}]}]}
 
     monkeypatch.setattr(providers, "_chat_json", reply)
-    result = asyncio.run(providers.answer_llm("AlphaNet-3 error?", [evidence_factory("AlphaNet-3 accuracy is 88%.")], {"model": "offline", "task_protocol": "legacy"}))
+    result = asyncio.run(providers.answer_llm("AlphaNet-3 error?", [evidence_factory("AlphaNet-3 accuracy is 88%.")], {"model": "offline"}))
     assert len(calls) == 1  # Semantic uncertainty must not trigger a paid format correction.
     assert result["verdict"] == "insufficient"
     assert "错误率为88" not in result["answer"]
@@ -64,7 +64,7 @@ def test_unsafe_model_verdict_is_auditable_and_not_rewritten_to_opposite(monkeyp
                             "evidence": [{"handle": "F1"}]}]}
 
     monkeypatch.setattr(providers, "_chat_json", reply)
-    result = asyncio.run(providers.verify_claim(claim, [evidence_factory("AlphaNet-3 error on BenchSet is 10%.")], {"model": "offline", "task_protocol": "legacy"}))
+    result = asyncio.run(providers.verify_claim(claim, [evidence_factory("AlphaNet-3 error on BenchSet is 10%.")], {"model": "offline"}))
     assert result["verdict"] == "insufficient"
     check = result["claim_checks"][0]
     assert check["model_verdict"] == "contradicted"

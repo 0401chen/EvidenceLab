@@ -17,7 +17,7 @@ from backend.app.parsing import parse_document
 
 
 # These saved V1 response fixtures exercise the explicit compatibility seam.
-CONFIG = {"model": "offline-fixture", "base_url": "http://offline.invalid/v1", "enrich_metadata": False, "task_protocol": "legacy"}
+CONFIG = {"model": "offline-fixture", "base_url": "http://offline.invalid/v1", "enrich_metadata": False}
 
 
 def field(value, quote, source="S1"):

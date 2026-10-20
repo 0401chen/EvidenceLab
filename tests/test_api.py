@@ -23,32 +23,6 @@ def test_empty_workspace_and_health(client):
     assert "llm_configured" in health.json()["providers"]
 
 
-def test_experimental_task_engine_is_explicit_and_legacy_route_stays_legacy(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-    from backend.app.main import create_app
-    from backend.app import providers
-    monkeypatch.setenv("LLM_API_KEY", "offline-route-key")
-    monkeypatch.setenv("LLM_MODEL", "offline-model")
-    monkeypatch.setenv("LLM_BASE_URL", "http://offline.invalid/v1")
-    seen = []
-
-    async def answer(question, evidence, config):
-        seen.append(config["task_protocol"])
-        result = {"answer": "没有已核实结果", "mode": "llm", "verdict": "insufficient",
-                  "citations": [], "traces": [], "warnings": []}
-        if config["task_protocol"] == "structured":
-            result["task_protocol"] = "requirements_observations_v1"
-        return result
-
-    monkeypatch.setattr(providers, "answer_llm", answer)
-    with TestClient(create_app(tmp_path / "isolated")) as scoped:
-        paper = upload(scoped, "source.md", "# Offline source\nAtlas-A is evaluated.")
-        for engine in ("llm", "llm_tasks"):
-            response = scoped.post("/api/qa", json={"question": "Atlas-A?", "paper_ids": [paper["id"]], "engine": engine})
-            assert response.status_code == 200
-            assert response.json()["mode"] == engine
-    assert seen == ["legacy", "structured"]
-
 
 def test_public_settings_never_expose_key_or_url_credentials(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient

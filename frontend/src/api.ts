@@ -2,14 +2,8 @@ export type Paper = {id:string;title:string;filename:string;authors:string[];yea
 export type Evidence = {id:string;paper_id:string;page:number;section:string;text:string;bbox:number[]|null;source_type:'text'|'table'};
 export type FieldQuote = {id:string;quote:string};
 export type CitationQuote = FieldQuote & {paper_id?:string;page?:number;handle?:string;source_start?:number;source_end?:number;protocol?:'server_bound_fragment'|'legacy_quote'};
-export type TaskObservationField = {text:string;evidence:CitationQuote[]};
-export type TaskObservation = {fields:Record<string,TaskObservationField>;status?:'accepted'|'withheld';reasons?:string[]};
-export type TaskFieldComparison = {field:string;expected:unknown;observed:unknown;relation:'match'|'conflict'|'unknown';basis?:'literal'|'semantic_model';reason?:string};
-export type TaskRow = {id:string;request:string;subject:string;fields:string[];status:'answered'|'partial'|'insufficient';observations:TaskObservation[];missing_fields:string[];field_comparisons:TaskFieldComparison[];verdict?:'supported'|'partial'|'contradicted'|'insufficient';explanation?:string};
-export type TaskCoverage = {planned:number;addressed:number;answered:number;missing:number;unaddressed?:number;complete:boolean;source_complete:boolean};
-export type TaskResult = {task_protocol?:'requirements_observations_v1';task_rows?:TaskRow[];coverage?:TaskCoverage};
 export type ClaimCheck = {claim:string;verdict:'supported'|'contradicted'|'insufficient';explanation:string;citation_quotes:CitationQuote[];safety_gaps?:string[];model_verdict?:'supported'|'contradicted';model_explanation?:string};
-export type VerificationDetail = TaskResult & {verdict:'supported'|'partial'|'insufficient'|'contradicted';explanation:string;status?:'failed';citation_quotes?:CitationQuote[];claim_checks?:ClaimCheck[];citations?:Evidence[];verification_protocol?:'atomic_checks_v1'|'legacy_exact_quote';safety_gaps?:string[];model_verdict?:string;model_explanation?:string};
+export type VerificationDetail = {verdict:'supported'|'partial'|'insufficient'|'contradicted';explanation:string;status?:'failed';citation_quotes?:CitationQuote[];claim_checks?:ClaimCheck[];citations?:Evidence[];verification_protocol?:'atomic_checks_v1'|'legacy_exact_quote';safety_gaps?:string[];model_verdict?:string;model_explanation?:string};
 export type Experiment = {id:string;paper_id:string;name:string;task?:string|null;paper_title?:string;method:string|null;dataset:string|null;split:string|null;metric:string|null;value:number|null;unit:string|null;sample_size:string|null;conditions:Record<string,string>;evidence_ids:string[];extraction_method:'rule'|'llm'|'demo'|'manual';notes:string[];field_evidence:Record<string,string[]>;evidence_quotes?:Record<string,FieldQuote[]>;source_pages?:number[];review_required?:boolean;manual_edited?:boolean};
 export type ExtractionCandidate = {id:string;paper_id:string;mode:'rule'|'llm'|'manual';status:'pending'|'accepted'|'rejected';created_at:string;experiments:Experiment[];accepted_experiment_ids?:string[];stale?:boolean;reparsed?:boolean;source_evidence?:Evidence[];extraction_scope?:{pages:number[]|null;total_pages:number;max_results:number;truncated:boolean;completeness:'not_assessed'}};
 export type PaperDetail = Paper & {evidence:Evidence[];experiments:Experiment[];experiment_revisions?:Record<string,string>;extraction_candidates?:ExtractionCandidate[];latest_extraction_candidate_id?:string};
@@ -17,15 +11,18 @@ export type ExperimentHistoryEntry = {id:string;experiment:Experiment;created_at
 export type Trace = {agent:string;status:'completed'|'skipped'|'failed';summary:string;evidence_ids:string[];duration_ms:number;kind?:string;input?:Record<string,unknown>;output?:Record<string,unknown>};
 export type Comparison = {id:string;left_id:string;right_id:string;comparability:'direct'|'conditional'|'incomparable'|'insufficient';verdict:'consistent'|'different'|'conditions_differ'|'potential_conflict'|'insufficient';reasons:string[];differences:string[];evidence_ids:string[];delta:number|null;alignment?:Record<string,{left:unknown;right:unknown;status:'same'|'different'|'missing'}>;conflict_evidence?:(FieldQuote&{paper_id:string;direction:string})[];unit_conversion?:Record<string,unknown>|null};
 export type CompareResult = {id:string;papers:Paper[];experiments:Experiment[];comparisons:Comparison[];traces:Trace[];created_at:string;mode:string;warnings?:string[];evidence?:Evidence[];stale?:boolean;stale_reason?:string};
-export type QAResult = TaskResult & {answer:string;mode:string;citations:Evidence[];traces:Trace[];warnings:string[];verdict:'evidence_found'|'insufficient'|'unverified';citation_quotes?:CitationQuote[];assertion_evidence?:{text:string;citation_quotes:CitationQuote[]}[];withheld_assertions?:{text:string;reasons:string[];citation_quotes:CitationQuote[]}[];verification?:VerificationDetail;retrieval?:{matched:number;selected:number;total:number;coverage_limited:boolean;papers_covered:number;papers_selected:number}};
+export type QAResult = {answer:string;mode:string;citations:Evidence[];traces:Trace[];warnings:string[];verdict:'evidence_found'|'insufficient'|'unverified';citation_quotes?:CitationQuote[];assertion_evidence?:{text:string;citation_quotes:CitationQuote[]}[];withheld_assertions?:{text:string;reasons:string[];citation_quotes:CitationQuote[]}[];verification?:VerificationDetail;retrieval?:{matched:number;selected:number;total:number;coverage_limited:boolean;papers_covered:number;papers_selected:number}};
 export type VerifyResult = VerificationDetail & {mode:string;citations:Evidence[];traces:Trace[];warnings:string[]};
 export type Health = {status:string;version:string;providers:{llm_configured:boolean;langgraph_available?:boolean;llm_status?:'unconfigured'|'untested'|'available'|'failed'}};
 export type ReportSummary = {id:string;created_at:string;papers:Paper[];experiment_count:number;comparison_count:number;stale:boolean;stale_reason?:string};
-export type Engine = 'local'|'llm'|'llm_tasks';
+export type Engine = 'local'|'llm';
 export type VerifyEngine = Engine;
 export function engineIsAvailable(engine:Engine,providers?:Health['providers']):boolean{
  if(engine==='local')return true;
  return !!providers?.llm_configured;
+}
+export function defaultEngine(providers?:Health['providers']):Engine{
+ return providers?.llm_configured?'llm':'local';
 }
 export class ApiError extends Error {
  constructor(message:string, public status:number, public code?:string){super(message);this.name='ApiError';}
@@ -75,25 +72,4 @@ export function qaDisplayAnswer(result:QAResult):string{
  if(!result.withheld_assertions?.length)return result.answer;
  const accepted=result.assertion_evidence??[];
  return accepted.length?accepted.map(item=>item.text).join('\n\n'):'本次未形成可展示的事实回答。部分模型断言未通过来源检查，已暂缓，请核对原表或补充证据。';
-}
-
-export function hasTaskRequirements(result:TaskResult):boolean{
- return result.task_protocol==='requirements_observations_v1'&&Array.isArray(result.task_rows);
-}
-export function taskCoverageLabel(coverage?:TaskCoverage):string{
- if(!coverage)return '尚未返回子项覆盖统计';
- return coverage.complete?'子项均已回答或明确不足':'仍有子项未处理';
-}
-export function distinctTaskObservations(observations:TaskObservation[]):TaskObservation[]{
- const seen=new Set<string>();
- return observations.filter(observation=>{
-  // Only suppress exact repeated field/source records. Equal numbers belonging
-  // to different models or sources remain separate observations.
-  const signature=JSON.stringify([observation.status??'legacy',observation.reasons??[],Object.entries(observation.fields).sort(([a],[b])=>a.localeCompare(b)).map(([key,field])=>[key,field.text,field.evidence])]);
-  if(seen.has(signature))return false;seen.add(signature);return true;
- });
-}
-export function taskFieldBindings(field:TaskObservationField,citations:Evidence[]):{quotes:CitationQuote[];sources:Evidence[]}{
- const quotes=field.evidence;
- return {quotes,sources:citations.filter(source=>quotes.some(quote=>quote.id===source.id))};
 }

@@ -6,7 +6,7 @@ import ts from 'typescript';
 // Compile with the project's existing TypeScript dependency; no extra test runtime.
 const source=await readFile(new URL('../src/api.ts',import.meta.url),'utf8');
 const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
-const {ApiError,isCancelled,post,qaDisplayAnswer,request}=await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const {ApiError,defaultEngine,engineIsAvailable,isCancelled,post,qaDisplayAnswer,request}=await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 const originalFetch=globalThis.fetch;
 afterEach(()=>{globalThis.fetch=originalFetch;});
 
@@ -44,14 +44,14 @@ test('JSON posts preserve the explicit paper scope and engine',async()=>{
  assert.equal((await post('/qa',{paper_ids:['paper-a'],question:'dataset?',engine:'local'})).answer,'candidate evidence');
 });
 
-test('trial QA and verification preserve the chosen engine without replacing normal model requests',async()=>{
+test('QA and verification preserve explicit local or model choices',async()=>{
  const calls=[];
  globalThis.fetch=async(url,init)=>{
   const body=JSON.parse(init.body);calls.push({url,body});
   return Response.json({mode:body.engine,answer:'mock response'});
  };
  for(const path of ['/qa','/verify']){
-  for(const engine of ['llm','llm_tasks']){
+  for(const engine of ['local','llm']){
    const body={paper_ids:['paper-a'],engine,...(path==='/qa'?{question:'conditions?'}:{claim:'A testable claim.'})};
    assert.equal((await post(path,body)).mode,engine);
    assert.deepEqual(calls.at(-1),{url:`/api${path}`,body});
@@ -144,4 +144,22 @@ test('stale edit submissions preserve the version token and never auto-retry',as
  };
  await assert.rejects(request('/experiments/e',{method:'PATCH',body:JSON.stringify({expected_revision:revision,name:'edited'})}),err=>err.status===409);
  assert.equal(calls,1);
+});
+
+
+test('configured providers default to model and local remains an explicit choice',()=>{
+ assert.equal(defaultEngine({llm_configured:true}),'llm');
+ assert.equal(defaultEngine({llm_configured:false}),'local');
+ assert.equal(defaultEngine(),'local');
+ assert.equal(engineIsAvailable('local',{llm_configured:true}),true);
+ assert.equal(engineIsAvailable('llm',{llm_configured:false}),false);
+});
+
+test('QA and verification menus only contain the two supported engines',async()=>{
+ const app=await readFile(new URL('../src/App.tsx',import.meta.url),'utf8');
+ const options=app.slice(app.indexOf('export function ResearchEngineOptions'),app.indexOf('function formatDate'));
+ assert.deepEqual([...options.matchAll(/<option value="([^"]+)"/g)].map(match=>match[1]),['local','llm']);
+ assert.match(options,/大模型增强问答/);
+ assert.match(options,/模型语义核验/);
+ assert.doesNotMatch(app,/llm_tasks|TaskRequirements/);
 });
