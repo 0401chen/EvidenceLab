@@ -241,6 +241,37 @@ def _record_sections(text: str) -> list[str]:
     return sections
 
 
+_PROSE_CONFIGURATION_NOUN = (
+    r"(?:(?:independent|random|different|separate|repeated|training|train|validation|test|"
+    r"labelled|labeled|unlabelled|unlabeled|total)\s+){0,3}"
+    r"(?:runs?|trials?|epochs?|iterations?|repetitions?|repeats?|seeds?|"
+    r"samples?|examples?|instances?|observations?|nodes?|batches|batch(?:\s+size)?|"
+    r"steps?|updates?|learning[\s-]+rate|dropout(?:[\s-]+rate)?|hidden[\s-]+units?)\b"
+)
+_PROSE_CONFIGURATION_SUFFIX = re.compile(
+    rf"^\s*(?:(?:[-–—]\s*)?{_PROSE_CONFIGURATION_NOUN}|"
+    rf"[\[(]\s*{_PROSE_CONFIGURATION_NOUN}\s*[\])])",
+    re.I,
+)
+
+
+def _prose_measurements(pattern: str, text: str) -> list[re.Match]:
+    """Keep direct metric/result pairs, not a count whose noun was truncated.
+
+    ``accuracy of N runs`` shares the prefix of a measurement but N belongs to
+    the run count. Inspect the source *after* the number (and optional percent)
+    before creating a short field quote. Do not search ahead for another number
+    or infer any unreported result, unit, method or dataset.
+    """
+    matches = []
+    for match in re.finditer(pattern, text, re.I):
+        end = match.end(3) if match[3] else match.end(2)
+        if _PROSE_CONFIGURATION_SUFFIX.match(readable_text(text[end:])):
+            continue
+        matches.append(match)
+    return matches
+
+
 def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
     experiments: list[dict] = []
     for source in evidence:
@@ -304,7 +335,7 @@ def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
             # No assignment of surrounding values to a named method or dataset.
             metric_pattern = r"top[- ]?\d+ (?:(?:test|validation|classification) )?(?:error|accuracy)|error rate|test error|classification error|accuracy|precision|recall|F1(?:[- ]score)?|AUROC|AUC|RMSE|MAE|MSE|错误率|误差率|准确率|精确率|召回率|均方根误差|均方误差|平均绝对误差"
             pattern = rf"(?<![a-zA-Z])({metric_pattern})\s*(?:(?:of|was|is|reached|equals?)\s+|(?:[:=：]|为|达到|达到了|是)\s*)?({NUMBER_PATTERN})(?!\w|,|\.\d)\s*(%|％)?"
-            matches = list(re.finditer(pattern, numeric_text(content), re.I))
+            matches = _prose_measurements(pattern, numeric_text(content))
             for match_index, metric_match in enumerate(matches):
                 value, _ = _number(metric_match[2])
                 if value is None:
@@ -317,7 +348,7 @@ def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
                     item["field_evidence"]["unit"] = [source["id"]]
                 # Preserve the original spelling (including a Unicode minus)
                 # rather than storing a rewritten quote from numeric_text.
-                occurrences = [m for m in re.finditer(pattern, content, re.I)
+                occurrences = [m for m in _prose_measurements(pattern, content)
                                if decimal_number(m[2]) == decimal_number(metric_match[2])
                                and _canonical_metric(m[1]) == item["metric"]]
                 occurrence_index = sum(_canonical_metric(m[1]) == item["metric"]
@@ -336,7 +367,7 @@ def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
                 for begin, end in zip(boundaries, boundaries[1:]):
                     sentence = content[begin:end]
                     if ((original_match is not None and not begin <= original_match.start() < end)
-                            or original not in sentence or len(list(re.finditer(pattern, numeric_text(sentence), re.I))) != 1):
+                            or original not in sentence or len(_prose_measurements(pattern, numeric_text(sentence))) != 1):
                         continue
                     item["_candidate_text"] = sentence
                     configurations = list(re.finditer(
