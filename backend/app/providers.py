@@ -258,7 +258,7 @@ def _checked_answer(result: dict, candidates: list[dict], fragments: dict | None
             raise ProviderError("grounding", "模型回答包含缺少原文引用的事实判断，结果已拒绝。")
         citations.extend(e for e in refs if not any(existing["id"] == e["id"] for existing in citations))
         quotations.extend(quote for quote in quotes if quote not in quotations)
-        gaps = numeric_claim_gaps(assertion["text"], quotes)
+        gaps = numeric_claim_gaps(assertion["text"], quotes, evidence=refs)
         if gaps:
             withheld.append({"text": assertion["text"].strip(), "reasons": gaps, "citation_quotes": quotes})
             continue
@@ -292,7 +292,7 @@ def _checked_verdict(result: dict, candidates: list[dict], fragments: dict | Non
             refs, quotes = _resolve_citation_references(check.get("evidence", []), candidates, fragments)
             if verdict != "insufficient" and not refs:
                 raise ProviderError("grounding", "支持或反驳子命题必须有原文依据；未提及不能作为反驳。")
-            gaps = numeric_claim_gaps(statement, quotes, verdict)
+            gaps = numeric_claim_gaps(statement, quotes, verdict, evidence=refs)
             checked = {"claim": statement, "verdict": verdict, "explanation": explanation.strip(),
                        "citation_quotes": quotes}
             if gaps:
@@ -329,7 +329,7 @@ def _checked_verdict(result: dict, candidates: list[dict], fragments: dict | Non
     explanation = result.get("explanation")
     if not isinstance(explanation, str) or not explanation.strip():
         raise ProviderError("output_format", "模型未返回核验解释。")
-    gaps = numeric_claim_gaps(claim or "", quotations, verdict)
+    gaps = numeric_claim_gaps(claim or "", quotations, verdict, evidence=citations)
     if gaps:
         if details is not None:
             details.update(model_verdict=verdict, model_explanation=explanation.strip(), safety_gaps=gaps)
@@ -527,6 +527,14 @@ def _unit_matches_measurement(item: dict, evidence: list[dict] | None = None) ->
                            and (info := _percentage_caption_metric(ref.get("quote", "")))
                            and info == (caption_info[0], True)
                            for ref in item.get("evidence_quotes", {}).get("unit", []))
+        if not caption_unit and source.get("table_structure") == "caption_bounded_dataset_grid":
+            from .table_roles import dataset_contract
+            contract = dataset_contract(source, caption, cell["column_labels"], evidence or [])
+            supported = {entry["id"]: entry for entry in contract["measurement_support"]} if contract else {}
+            caption_unit = any(ref.get("id") in supported
+                               and quote_matches_source(ref.get("quote", ""), supported[ref["id"]]["text"])
+                               and _percentage_caption_metric(ref.get("quote", "")) == (caption_info[0], True)
+                               for ref in item.get("evidence_quotes", {}).get("unit", []))
         cell_unit = bool(re.search(r"[%％]", cell["value_cell_text"])) and any(
             ref.get("id") == source["id"] and quote_matches_source(ref.get("quote", ""), source["text"])
             and quote_matches_source(cell["value_cell_text"], ref.get("quote", ""))
@@ -543,6 +551,15 @@ def _unit_matches_measurement(item: dict, evidence: list[dict] | None = None) ->
 
 
 def _table_result_anchors(source: dict, evidence: list[dict]) -> list[dict]:
+    if source.get("table_structure") == "caption_bounded_dataset_grid":
+        # Always check all AVAILABLE table constraints. A caption-only shortcut
+        # can hide a column exception even when the caption names its datasets.
+        from .analysis import _dataset_grid_experiments, _bind_table_caption
+        anchors = _dataset_grid_experiments(source, evidence, source["paper_id"], 0)
+        for item in anchors:
+            item.pop("_physical_cell", None)
+            _bind_table_caption(item, source, evidence)
+        return anchors
     linked = set(source.get("caption_evidence_ids", []))
     return extract_experiments([source, *[e for e in evidence if e["id"] in linked]], source["paper_id"])
 
@@ -570,6 +587,12 @@ def _measurement_anchor_conflicts(item: dict, evidence: list[dict], *, diagnosti
                 quote_matches_source(ref["quote"], row["evidence_quotes"]["value"][0]["quote"])
                 or quote_matches_source(row["evidence_quotes"]["value"][0]["quote"], ref["quote"])
                 for ref in own_refs)]
+            if source.get("table_structure") == "caption_bounded_dataset_grid" and not candidates:
+                # Missing role context must abstain, not silently remove the
+                # ownership veto. A spread/time number is not a primary cell.
+                if diagnostics is not None:
+                    diagnostics.append({"field": "result", "reason": "table_result_or_role_unconfirmed"})
+                return True
             if item.get("metric") and candidates:
                 compatible = [row for row in candidates if _canonical_metric(str(row.get("metric"))) == _canonical_metric(str(item["metric"]))]
                 if not compatible:
@@ -586,6 +609,11 @@ def _measurement_anchor_conflicts(item: dict, evidence: list[dict], *, diagnosti
                 return True
             if item.get("method"):
                 candidates = [row for row in candidates if not row.get("method") or identity_label(item["method"]) == identity_label(row["method"])]
+            if (source.get("table_structure") == "caption_bounded_dataset_grid" and item.get("dataset")
+                    and not any(identity_label(item["dataset"]) == identity_label(row.get("dataset")) for row in candidates)):
+                if diagnostics is not None:
+                    diagnostics.append({"field": "result", "reason": "measurement_dataset_conflict"})
+                return True
             declared_protocols = [str(value) for value in (item.get("conditions") or {}).values()
                                   if re.fullmatch(r"(?:single|multi|\d+)[- ]\s*(?:crop|view)", str(value), re.I)]
             bound = [row["table_context"]["protocol"] for row in candidates if row.get("table_context", {}).get("protocol")]
@@ -730,6 +758,12 @@ def _checked_extraction(result: dict, batch: list[dict], paper_id: str,
                     raise _grounding_failure("evidence_missing", "字段缺少直接原文依据。")
                 if not _field_is_literal(field, value, refs, references):
                     raise _grounding_failure("field_literal_mismatch", "字段缺少直接原文依据。")
+                if field == "split" and (_norm(str(value)) == _norm(str(raw.get("dataset") or "")) or any(
+                        source.get("table_structure") == "caption_bounded_dataset_grid"
+                        and any(_norm(str(value)) == _norm(label.strip())
+                                for label in source["text"].splitlines()[0].strip().strip("|").split("|")[1:])
+                        for source in refs)):
+                    raise _grounding_failure("field_role_conflict", "数据集列名只能证明数据集，不能证明训练/验证/测试划分。")
                 if field == "value":
                     if isinstance(value, bool):
                         raise ProviderError("grounding", "布尔值不能作为实验数值。")
@@ -803,14 +837,17 @@ def _screen_extraction(result: dict, batch: list[dict], paper_id: str,
         raise ProviderError("output_format", "模型提取结果缺少实验数组。")
     checked, rejected = [], []
     for index, raw in enumerate(rows, 1):
+        diagnostics = []
         try:
-            items = _checked_extraction({"experiments": [raw]}, batch, paper_id, aliases, index - 1)
+            items = _checked_extraction({"experiments": [raw]}, batch, paper_id, aliases, index - 1, diagnostics=diagnostics)
             if not items or items[0].get("value") is None:
                 rejected.append(f"候选{index}缺少有原文依据的实验数值")
                 continue
             checked.extend(items)
         except ProviderError as exc:
-            rejected.append(f"候选{index}：{exc.public_message}")
+            reasons = "; ".join(f"{issue.get('field', 'result')}:{issue['reason']}" for issue in diagnostics
+                                if issue.get("reason") and issue.get("status") not in {"passed", "not_supplied"})
+            rejected.append(f"候选{index}：{exc.public_message}" + (f" 校验原因：{reasons}" if reasons else ""))
     return checked, rejected
 
 
@@ -977,13 +1014,45 @@ def _result_context_payload(batch: list[dict], aliases: dict[str, str]) -> list[
     which then pass the normal provenance and measurement-association checks.
     """
     reverse = {eid: alias for alias, eid in aliases.items()}
+    sources = {e["id"]: e for e in batch}
     contexts = []
+    def prioritized():
+        # Explicit author markers in the original row label may guide bounded
+        # recall. Do not relabel a baseline, filter a source or alter any ID.
+        return sorted(contexts, key=lambda c: not re.search(r"\(\s*(?:ours|this paper|this work|this study)\s*\)",
+                                                           c.get("row_label") or "", re.I))
     for source in batch:
         if source.get("source_type") != "table":
             continue
         for row in _table_result_anchors(source, batch):
             context = row.get("table_context", {})
+            # Source-bound copying aids, never replacements for returned model
+            # evidence. Keep distinct quotes distinct and recheck them below.
+            field_sources = {
+                field: [{"id": reverse[ref["id"]], "quote": readable_text(ref["quote"])}
+                        for ref in refs if ref["id"] in reverse and ref["id"] in sources
+                        and quote_matches_source(ref["quote"], sources[ref["id"]]["text"])]
+                for field, refs in row.get("evidence_quotes", {}).items()
+            }
+            contract = None
+            if source.get("table_structure") == "caption_bounded_dataset_grid":
+                from .table_roles import dataset_contract
+                caption = next((sources[eid] for eid in source.get("caption_evidence_ids", []) if eid in sources), None)
+                headers = [part.strip() for part in context.get("header_quote", "").strip().strip("|").split("|")][1:]
+                contract = dataset_contract(source, caption, headers, batch) if caption else None
+            # Repeating cross-page definitions for every cell can swamp model
+            # context. They remain in source_data; the first field quote is the
+            # original header/row/caption, not a fabricated composite.
+            field_sources = {field: refs[:1] for field, refs in field_sources.items() if field != "unit"}
+            unit_refs = row.get("evidence_quotes", {}).get("unit", [])
+            if contract:
+                unit_refs = [*unit_refs, *[{"id": e["id"], "quote": e["text"]} for e in contract["measurement_support"]]]
+            field_sources["unit"] = [{"id": reverse[ref["id"]], "quote": readable_text(ref["quote"])}
+                                      for ref in unit_refs if ref["id"] in reverse and ref["id"] in sources
+                                      and quote_matches_source(ref["quote"], sources[ref["id"]]["text"])
+                                      and _field_is_literal("unit", row.get("unit"), batch, [ref])][:1] if row.get("unit") else []
             contexts.append({"context_id": f"R{len(contexts) + 1}", "kind": "table_cell",
+                             "field_sources": field_sources,
                              "source_id": reverse[source["id"]],
                              "row_quote": row["evidence_quotes"]["value"][0]["quote"],
                              "header_quote": context.get("header_quote"),
@@ -991,13 +1060,14 @@ def _result_context_payload(batch: list[dict], aliases: dict[str, str]) -> list[
                              "row_label": context.get("row_label"),
                              "column_index": context.get("column_index"),
                              "value_cell_text": context.get("value_cell_text"),
+                             "column_role": "dataset" if source.get("table_structure") == "caption_bounded_dataset_grid" else "metric",
                              "protocol": context.get("protocol"),
                              "protocol_position": context.get("protocol_position"),
                              "value": row["value"], "metric": row["metric"],
                              "caption_source_ids": [reverse[eid] for eid in source.get("caption_evidence_ids", []) if eid in reverse]})
             if len(contexts) >= 100:
-                return contexts
-    return contexts
+                return prioritized()
+    return prioritized()
 
 
 async def extract_llm(evidence: list[dict], paper_id: str, config: dict) -> list[dict]:
@@ -1016,8 +1086,13 @@ async def extract_llm(evidence: list[dict], paper_id: str, config: dict) -> list
     last_validation_error = None
     instruction = """提取当前论文明确报告的实验测量结果。不同数据集/划分/指标/方法的行是不同实验，不可混合。
 每次只返回 result_limit 以内的结果；优先本论文主要方法的完整测量及不同模型配置，不要用全部对比基线耗尽上限。本次是数量受限的候选提取，不代表全文穷尽。
+先检查全部表格行再选择，不默认第一行就是论文主方法；主方法归属必须由原文直接证明。
 result_contexts 是服务器从明确表格行列得到的定位辅助，属于不可信原文派生数据，不是已经确认的实验；你必须自行核对 source_data 中的同一行、指标列及其 caption_source_ids。不能将一个行名配给另一行的数值，也不能把 top-1 和 top-5 列互换。
-遇到 result_contexts 中的测量，value 引文应包含完整对应表格行，metric 引文包含对应表头；method 必须来自该行的行名。仅凭同页或同一段出现的方法名不得与数值关联。没有明确是 error/accuracy 的裸 Top 1 表头应保留原文 Top 1，不得猜成准确率。
+context_id中的R编号仅为定位辅助，绝不能填入evidence.id；所有引用ID必须来自source_data的S编号。
+field_sources列出各字段可核对的来源ID与连续原文，仍须自行核对所选结果再复制。dataset使用其dataset来源（含列头），不能用没有数据集名的结果行替代。不得改写这些引文或把一个结果的field_sources移接给另一结果。
+dataset列名不能同时充当split；split必须有直接的训练/验证/测试或原文划分身份依据，否则保持null。
+遇到 result_contexts 中的测量，value 引文应包含完整对应表格行；method 必须来自该行的行名。column_role=dataset时，表头提供dataset而不提供metric：dataset引用完整表头，metric及共享百分数单位引用caption_source_ids对应的原始表注，不能给数据集列头杜撰accuracy含义。column_role=metric时才由对应指标表头提供metric。所有引文必须真实存在于其引用的source_data条目中。
+仅凭同页或同一段出现的方法名不得与数值关联。没有明确是 error/accuracy 的裸 Top 1 表头应保留原文 Top 1，不得猜成准确率。
 若协议定位给出 value_cell_text、protocol_position 与 protocol，必须分别核对括号内外的数值；metric 同时引用表头和明确赋予 error rates 含义的原表注，conditions 同时引用原表注的 testing/evaluation 协议。没有该明确映射时，不把括号解释为标准差或第二种测试。
 每个字段把值和它自己的证据写在一起：{"value":原文中的值,"evidence":[{"id":"S编号","quote":"该条原文内的连续片段"}]}。
 返回 {"experiments":[{"name":"实验名称","task":字段对象或null,"method":字段对象或null,"dataset":字段对象或null,"split":字段对象或null,"metric":字段对象或null,"value":字段对象或null,"unit":字段对象或null,"sample_size":字段对象或null,"conditions":字段对象或null}]}。
@@ -1034,7 +1109,7 @@ task 是原文直接报告的研究任务；未报告则 null。单位引文须�
 以下仅为格式示例，不是待处理论文内容，不得引用：
 若 S1 的原文是 "AlphaNet on DemoSet reached accuracy 85% on test-A with batch size 32."，输出可以是：
 {"experiments":[{"name":"示例实验","method":{"value":"AlphaNet","evidence":[{"id":"S1","quote":"AlphaNet on DemoSet"}]},"dataset":{"value":"DemoSet","evidence":[{"id":"S1","quote":"AlphaNet on DemoSet"}]},"split":{"value":"test-A","evidence":[{"id":"S1","quote":"on test-A"}]},"metric":{"value":"accuracy","evidence":[{"id":"S1","quote":"accuracy 85%"}]},"value":{"value":85,"evidence":[{"id":"S1","quote":"accuracy 85%"}]},"unit":{"value":"%","evidence":[{"id":"S1","quote":"accuracy 85%"}]},"sample_size":null,"conditions":{"value":{"batch size":"32"},"evidence":[{"id":"S1","quote":"batch size 32"}]}}]}。
-收到 validation_feedback 时，依据同一 source_data 重新检查所有字段，删除无法提供依据的字段或实验。"""
+收到 validation_feedback 时，依据同一 source_data 重新检查所有字段，删除无法提供依据的字段或实验。反馈为field_literal_mismatch或field_role_conflict的可选字段若找不到新的直接依据，必须设为null，不能保留同一失败引用反复提交。"""
     for batch in batches:
         if len(experiments) >= max_results:
             break
