@@ -29,6 +29,7 @@ def _trace(agent: str, summary: str, started: float, ids: list[str] | None = Non
 def run_comparison(experiments: list[dict], evidence: list[dict]) -> dict:
     from langgraph.graph import END, START, StateGraph
     from .analysis import compare_experiments
+    from .experiment_validation import machine_measurement_verified
     from .providers import _field_is_literal, _measurement_anchor_conflicts, _metadata_measurement_conflicts, _unit_matches_measurement
 
     def prepare(state: ComparisonState):
@@ -58,6 +59,51 @@ def run_comparison(experiments: list[dict], evidence: list[dict]) -> dict:
         started = time.perf_counter()
         known = {e["id"]: e for e in state["evidence"]}
         experiments_by_id = {e["id"]: e for e in state["experiments"]}
+        # Every experiment is immutable within this request. Its source checks
+        # do not depend on the other member of a pair: run them once, not N times.
+        # The cache is request-local, and retains all failures and source checks.
+        def check_experiment(exp):
+            owners_valid = True
+            unsupported = set()
+            if "machine_verification" in exp and not machine_measurement_verified(exp, state["evidence"]):
+                owners_valid = False
+                unsupported.add("machine_measurement")
+            own = [ref for ref in exp.get("evidence_ids", []) if ref in known and known[ref]["paper_id"] == exp["paper_id"]]
+            owners_valid = owners_valid and bool(own) and len(own) == len(exp.get("evidence_ids", []))
+            value_refs = exp.get("field_evidence", {}).get("value", [])
+            owners_valid = owners_valid and bool(value_refs) and all(ref in own for ref in value_refs)
+            value_quotes = exp.get("evidence_quotes", {}).get("value", [])
+            owners_valid = owners_valid and bool(value_quotes) and all(
+                isinstance(ref, dict) and ref.get("id") in value_refs and ref["id"] in own
+                and quote_matches_source(ref.get("quote"), known[ref["id"]]["text"])
+                and number_in_text(exp.get("value"), ref["quote"]) for ref in value_quotes)
+            if not _unit_matches_measurement(exp, state["evidence"]):
+                owners_valid = False
+                unsupported.add("unit")
+            if _measurement_anchor_conflicts(exp, state["evidence"]):
+                owners_valid = False
+                unsupported.add("result_association")
+            for field in ("task", "method", "dataset", "split", "metric", "value", "unit", "sample_size", "conditions"):
+                value = exp.get(field)
+                if value is None or value == "" or value == {}:
+                    continue  # The alignment stage already reports missing values.
+                field_ids = exp.get("field_evidence", {}).get(field, [])
+                quotations = exp.get("evidence_quotes", {}).get(field, [])
+                valid = (isinstance(field_ids, list) and bool(field_ids)
+                         and all(ref in own for ref in field_ids)
+                         and isinstance(quotations, list) and bool(quotations)
+                         and all(isinstance(ref, dict) and ref.get("id") in field_ids
+                                 and quote_matches_source(ref.get("quote"), known[ref["id"]]["text"])
+                                 for ref in quotations))
+                if valid:
+                    valid = (_field_is_literal(field, value, [known[ref] for ref in field_ids], quotations)
+                             and not _metadata_measurement_conflicts(exp, field))
+                if not valid:
+                    owners_valid = False
+                    unsupported.add(field)
+            return owners_valid, set(own), unsupported
+
+        verified = {eid: check_experiment(exp) for eid, exp in experiments_by_id.items()}
         checked = []
         all_ids = set()
         for original in state["comparisons"]:
@@ -67,41 +113,10 @@ def run_comparison(experiments: list[dict], evidence: list[dict]) -> dict:
             allowed = set()
             unsupported = set()
             for eid in (item["left_id"], item["right_id"]):
-                exp = experiments_by_id[eid]
-                own = [ref for ref in exp.get("evidence_ids", []) if ref in known and known[ref]["paper_id"] == exp["paper_id"]]
-                owners_valid = owners_valid and bool(own) and len(own) == len(exp.get("evidence_ids", []))
-                value_refs = exp.get("field_evidence", {}).get("value", [])
-                owners_valid = owners_valid and bool(value_refs) and all(ref in own for ref in value_refs)
-                value_quotes = exp.get("evidence_quotes", {}).get("value", [])
-                owners_valid = owners_valid and bool(value_quotes) and all(
-                    isinstance(ref, dict) and ref.get("id") in value_refs and ref["id"] in own
-                    and quote_matches_source(ref.get("quote"), known[ref["id"]]["text"])
-                    and number_in_text(exp.get("value"), ref["quote"]) for ref in value_quotes)
-                if not _unit_matches_measurement(exp, state["evidence"]):
-                    owners_valid = False
-                    unsupported.add("unit")
-                if _measurement_anchor_conflicts(exp, state["evidence"]):
-                    owners_valid = False
-                    unsupported.add("result_association")
-                for field in ("task", "method", "dataset", "split", "metric", "value", "unit", "sample_size", "conditions"):
-                    value = exp.get(field)
-                    if value is None or value == "" or value == {}:
-                        continue  # The alignment stage already reports missing values.
-                    field_ids = exp.get("field_evidence", {}).get(field, [])
-                    quotations = exp.get("evidence_quotes", {}).get(field, [])
-                    valid = (isinstance(field_ids, list) and bool(field_ids)
-                             and all(ref in own for ref in field_ids)
-                             and isinstance(quotations, list) and bool(quotations)
-                             and all(isinstance(ref, dict) and ref.get("id") in field_ids
-                                     and quote_matches_source(ref.get("quote"), known[ref["id"]]["text"])
-                                     for ref in quotations))
-                    if valid:
-                        valid = (_field_is_literal(field, value, [known[ref] for ref in field_ids], quotations)
-                                 and not _metadata_measurement_conflicts(exp, field))
-                    if not valid:
-                        owners_valid = False
-                        unsupported.add(field)
+                valid_owner, own, gaps = verified[eid]
+                owners_valid = owners_valid and valid_owner
                 allowed.update(own)
+                unsupported.update(gaps)
             valid = [x for x in requested if x in allowed]
             if not owners_valid or not requested or len(valid) != len(requested):
                 item["verdict"] = "insufficient"

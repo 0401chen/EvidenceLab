@@ -24,7 +24,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .config import ROOT, Config
 from .errors import DocumentError, ProviderError
-from .experiment_validation import prepare_experiments
+from .experiment_validation import (prepare_experiments, verify_pdf_measurements,
+                                    machine_measurement_verified, prioritize_measurements)
 from .store import Store
 
 VERSION = "0.1.0"
@@ -301,6 +302,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             if is_demo:
                 paper["warnings"] = ["合成演示材料，仅用于演示软件流程，不代表真实科研结果。", *paper["warnings"]]
             experiments = prepare_experiments(experiments, paper, evidence)
+            if suffix == ".pdf" and not is_demo:
+                experiments = await run_in_threadpool(verify_pdf_measurements, experiments, paper, evidence, path, digest)
+                experiments = prioritize_measurements(experiments)
             try:
                 store.save_paper(paper, digest, path, evidence, experiments)
             except Exception:
@@ -460,6 +464,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if any(field in updates and updates[field] != experiment.get(field) for field in ("field_evidence", "evidence_ids")):
             experiment["evidence_quotes"] = {}
         experiment.update(updates)
+        experiment.pop("machine_verification", None)  # A manual edit is not a new machine audit.
         approved_ids = set(experiment.get("evidence_ids", []))
         if any(not set(ids).issubset(approved_ids) for ids in experiment.get("field_evidence", {}).values()):
             raise HTTPException(400, "字段证据必须同时列在该实验的原文证据中")
@@ -574,12 +579,16 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             experiments = await run_in_threadpool(extract_experiments, sources, paper_id)
         if not experiments:
             raise HTTPException(422, "未提取到有效实验，已有记录未修改。")
-        truncated = len(experiments) > body.max_results
-        experiments = experiments[:body.max_results]
         try:
             experiments = prepare_experiments(experiments, paper, sources)
         except ProviderError as exc:
             raise HTTPException(exc.status_code, exc.public_message) from None
+        if body.mode == "rule":
+            experiments = await run_in_threadpool(verify_pdf_measurements, experiments, paper, sources,
+                                                   store.get_file(paper_id), store.get_file_hash(paper_id))
+            experiments = prioritize_measurements(experiments)
+        truncated = len(experiments) > body.max_results
+        experiments = experiments[:body.max_results]
         try:
             candidate = store.save_extraction_candidate(paper_id, experiments, body.mode, store.experiment_revision(paper["experiments"]),
                                                         source_evidence=sources if parsed is not None else None,
@@ -741,7 +750,13 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             lines.append("|" + "|".join(safe(v) for v in [paper_names[exp["paper_id"]] + " / " + exp["name"], exp.get("task"), exp.get("method"), exp.get("dataset"), exp.get("split"), exp.get("metric"), exp.get("value"), exp.get("unit"), exp.get("sample_size"), conditions, ", ".join(exp.get("evidence_ids", []))]) + "|")
         lines.extend(["", "## 字段原文与复核", "", "以下引文用于定位字段来源；字面出现不能代替实验归属和语义复核。未报告字段没有被补齐。", ""])
         for exp in report["experiments"]:
-            lines.extend([f"### {safe(exp['name'])}", "", f"提取方式：{safe(exp.get('extraction_method'))}；复核状态：{'需人工复核' if exp.get('review_required', True) else '请确认复核记录'}。", ""])
+            review_label = ("测量字段机器核验通过；协议未核验；未进行人工审核" if machine_measurement_verified(exp)
+                            else "需人工复核" if exp.get("review_required", True) else "请确认复核记录")
+            lines.extend([f"### {safe(exp['name'])}", "", f"提取方式：{safe(exp.get('extraction_method'))}；复核状态：{review_label}。", ""])
+            if machine_measurement_verified(exp):
+                check = exp["machine_verification"]
+                lines.extend(["测量字段机器核验通过（未进行人工审核）：方法、数据集、指标、主值及单位与原始 PDF 行列/表注相符。实验协议与统计结论不在认证范围。",
+                              f"完整结果单元格：{safe(check['raw_cell'])}；PDF SHA256：{check['pdf_sha256']}。", ""])
             for field, references in exp.get("evidence_quotes", {}).items():
                 for ref in references:
                     lines.extend([f"- {safe(field)} · {safe(ref.get('id'))}", "", "> " + str(ref.get("quote", "")).replace("\n", "\n> "), ""])

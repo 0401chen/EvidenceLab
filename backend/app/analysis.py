@@ -803,7 +803,7 @@ def _dataset_grid_experiments(source: dict, evidence: list[dict], paper_id: str,
             for annotation in ("uncertainty", "time_annotation"):
                 if annotation in measurement:
                     item["table_context"][annotation] = measurement[annotation]
-            item["notes"].append("按坐标行列、明确的数据集角色依据和受限全表指标声明提取，保留完整结果单元格；±未推定为标准差、标准误或置信区间，时间未推定为训练或推理时间。仍需人工审核。")
+            item["notes"].append("按坐标行列、明确的数据集角色依据和受限全表指标声明提取，保留完整结果单元格；±未推定为标准差、标准误或置信区间，时间未推定为训练或推理时间。是否通过机器核验及其范围请查看独立核验记录；未核验字段保持未知。")
             records.append(item)
     return records
 
