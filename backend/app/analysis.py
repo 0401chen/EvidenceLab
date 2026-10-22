@@ -274,6 +274,7 @@ def _prose_measurements(pattern: str, text: str) -> list[re.Match]:
 
 def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
     experiments: list[dict] = []
+    physical_cells = []
     for source in evidence:
         if source.get("paper_id") != paper_id:
             continue
@@ -282,13 +283,21 @@ def extract_experiments(evidence: list[dict], paper_id: str) -> list[dict]:
         text = str(source.get("text", ""))
         tables = _table_experiments(source, paper_id, len(experiments))
         if not tables:
+            tables = _dataset_grid_experiments(source, evidence, paper_id, len(experiments))
+        if not tables:
             tables = _caption_matrix_experiments(source, evidence, paper_id, len(experiments))
         if not tables:
             tables = _paired_protocol_table_experiments(source, evidence, paper_id, len(experiments))
         if tables:
             for item in tables:
                 _bind_table_caption(item, source, evidence)
-            experiments.extend(tables)
+                identity = item.pop("_physical_cell", None)
+                if identity is not None:
+                    from .table_roles import same_physical_cell
+                    if any(same_physical_cell(identity, old) for old in physical_cells):
+                        continue
+                    physical_cells.append(identity)
+                experiments.append(item)
             continue
         # Repeated fields denote a new row; never inherit settings implicitly.
         sections = _record_sections(text)
@@ -645,6 +654,160 @@ def _paired_protocol_table_experiments(source: dict, evidence: list[dict], paper
     return candidates
 
 
+def _dataset_result_cell(text: str) -> dict | None:
+    """Read a primary result and retain explicit annotations without naming them SD.
+
+    This is deliberately separate from _number: arbitrary prose, ranges and
+    unitless parentheses do not become measurements through this table path.
+    """
+    scalar = r"(?P<value>" + NUMBER_PATTERN + r")\s*(?P<unit>%)?"
+    match = re.fullmatch(scalar + r"(?:\s*(?P<notation>±|\+/-)\s*(?P<spread>"
+                         + NUMBER_PATTERN + r")\s*(?P<spread_unit>%)?|\s*\(\s*(?P<time>"
+                         + NUMBER_PATTERN + r")\s*(?P<time_unit>s|sec|ms)\s*\))?", numeric_text(text).strip(), re.I)
+    if not match:
+        return None
+    value, _ = _number(match["value"])
+    if value is None:
+        return None
+    result = {"value": value, "unit": "%" if match["unit"] or match["spread_unit"] else None}
+    if match["spread"] is not None:
+        spread, _ = _number(match["spread"])
+        if spread is None or spread < 0:
+            return None
+        result["uncertainty"] = {"notation": match["notation"], "value": match["spread"], "kind": "unspecified"}
+    if match["time"] is not None:
+        time, _ = _number(match["time"])
+        if time is None or time < 0:
+            return None
+        result["time_annotation"] = {"value": match["time"], "unit": match["time_unit"]}
+    return result
+
+
+def _dataset_grid_experiments(source: dict, evidence: list[dict], paper_id: str, offset: int) -> list[dict]:
+    """Consume the existing coordinate-backed model-by-benchmark PDF grid.
+
+    The parser already proved alignment/completeness. Recheck its literal layout
+    against the Markdown, require a single same-page caption metric, and keep
+    each result at its exact row and column. No neighbouring prose is inherited.
+    """
+    from .parsing import _percentage_caption_metric
+    from .table_roles import dataset_contract, method_identity, plain
+
+    ids = source.get("caption_evidence_ids", [])
+    if (source.get("source_type") != "table" or source.get("table_structure") != "caption_bounded_dataset_grid"
+            or source.get("caption_association") != "same_page_unique_geometry" or len(ids) != 1):
+        return []
+    captions = [e for e in evidence if e["id"] == ids[0] and e.get("paper_id") == paper_id
+                and e.get("page") == source.get("page") and not _is_reference(e)]
+    if len(captions) != 1:
+        return []
+    caption = captions[0]
+    lines = [line.strip() for line in source["text"].splitlines() if line.strip()]
+    if len(lines) < 4 or not re.fullmatch(r"[\s|:\-]+", lines[1]):
+        return []
+    parts = lambda line: [cell.strip() for cell in line.strip("|").split("|")]
+    headers = parts(lines[0])
+    configuration_headers = [re.sub(r"[_-]+", " ", header) for header in headers[1:]]
+    if (len(headers) < 2 or not re.fullmatch(r"models?|methods?|networks?|architectures?|approaches?", headers[0], re.I)
+            or len({_norm(header) for header in headers}) != len(headers)
+            or any(not re.search(r"[A-Za-z]", header) or _percentage_caption_metric(header) for header in headers[1:])
+            or any(re.search(_PROSE_CONFIGURATION_NOUN, header, re.I)
+                   or re.search(r"\b(?:layers?|channels?|heads?|width|depth|hidden size|weight decay|momentum|"
+                                r"regulari[sz]ation|l[12]|params?|parameters?)\b", header, re.I)
+                   for header in configuration_headers)):
+        return []
+    contract = dataset_contract(source, caption, headers[1:], evidence)
+    if contract is None:
+        return []
+    metric = contract["metric"]
+    def physical_box(box):
+        return (isinstance(box, (list, tuple)) and len(box) == 4
+                and all(type(v) in (int, float) and math.isfinite(v) for v in box)
+                and box[0] < box[2] and box[1] < box[3])
+    if (type(source.get("page")) is not int or source["page"] < 1
+            or not physical_box(source.get("bbox")) or not physical_box(caption.get("bbox"))):
+        return []
+    layouts = source.get("coordinate_rows", [])
+    if len(layouts) != len(lines) - 2:
+        return []
+    parsed_rows, labels = [], set()
+    for line, layout in zip(lines[2:], layouts):
+        cells = parts(line)
+        positions = layout.get("cells", [])
+        if (len(cells) != len(headers) or len(positions) != len(headers) or not cells[0]
+                or _norm(cells[0]) in labels or layout.get("row_label") != cells[0]
+                or any(position.get("text") != text or position.get("column_label") != header
+                       or position.get("page") != source.get("page")
+                       for position, text, header in zip(positions, cells, headers))):
+            return []
+        labels.add(_norm(cells[0]))
+        if any(not physical_box(position.get("bbox"))
+               or any(position["bbox"][i] < source["bbox"][i] - .02 for i in (0, 1))
+               or any(position["bbox"][i] > source["bbox"][i] + .02 for i in (2, 3)) for position in positions):
+            return []
+        values = []
+        for cell, position in zip(cells[1:], positions[1:]):
+            box = position.get("bbox", [])
+            if (len(box) != 4 or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in box)
+                    or box[0] >= box[2] or box[1] >= box[3]):
+                return []
+            if cell in {"-", "–", "—"}:
+                values.append(None)
+                continue
+            value = _dataset_result_cell(cell)
+            if value is None or not (value["unit"] or metric[1]):
+                return []
+            values.append(value)
+        is_method, method_support = method_identity(cells[0], source, caption, evidence)
+        if not is_method:
+            continue
+        parsed_rows.append((line, cells, positions, values, method_support))
+    records = []
+    # A dataset-major order is stable and covers model rows before moving to
+    # the next benchmark. The existing API still declares any result truncation.
+    for column in range(1, len(headers)):
+        for line, cells, positions, values, method_support in parsed_rows:
+            measurement = values[column - 1]
+            if measurement is None:
+                continue
+            item = _base_experiment(paper_id, source, offset + len(records))
+            item.update(name=f"{cells[0]} / {headers[column]}", method=cells[0], dataset=headers[column],
+                        metric=_canonical_metric(metric[0]), value=measurement["value"], unit=measurement["unit"] or "%")
+            provenance = {"method": (source, line), "dataset": (source, lines[0]), "value": (source, line),
+                          "metric": (caption, caption["text"]),
+                          "unit": (source, line) if measurement["unit"] else (caption, caption["text"])}
+            for field, (origin, quote) in provenance.items():
+                item["field_evidence"][field] = [origin["id"]]
+                item["evidence_quotes"][field] = [{"id": origin["id"], "quote": quote}]
+            item["evidence_ids"] = [source["id"], caption["id"]]
+            for support in method_support:
+                if support["id"] not in item["field_evidence"]["method"]:
+                    item["field_evidence"]["method"].append(support["id"])
+                    item["evidence_quotes"]["method"].append({"id": support["id"], "quote": support["text"]})
+                if support["id"] not in item["evidence_ids"]:
+                    item["evidence_ids"].append(support["id"])
+            for support in contract["dataset_support"][headers[column]]:
+                if support["id"] not in item["field_evidence"]["dataset"]:
+                    item["field_evidence"]["dataset"].append(support["id"])
+                    item["evidence_quotes"]["dataset"].append({"id": support["id"], "quote": support["text"]})
+                if support["id"] not in item["evidence_ids"]:
+                    item["evidence_ids"].append(support["id"])
+            item["table_context"] = {"table_evidence_id": source["id"], "caption_evidence_ids": ids,
+                                     "row_label": cells[0], "column_label": headers[column], "column_index": column,
+                                     "row_quote": line, "header_quote": lines[0], "value_cell_text": cells[column],
+                                     "value_bbox": positions[column]["bbox"]}
+            item["_physical_cell"] = {"paper": paper_id, "page": source["page"], "caption": plain(caption["text"]),
+                                      "headers": tuple(headers), "row": cells[0], "column": column,
+                                      "cell": cells[column], "metric": metric, "caption_box": caption["bbox"],
+                                      "row_box": positions[0]["bbox"], "value_box": positions[column]["bbox"]}
+            for annotation in ("uncertainty", "time_annotation"):
+                if annotation in measurement:
+                    item["table_context"][annotation] = measurement[annotation]
+            item["notes"].append("按坐标行列、明确的数据集角色依据和受限全表指标声明提取，保留完整结果单元格；±未推定为标准差、标准误或置信区间，时间未推定为训练或推理时间。仍需人工审核。")
+            records.append(item)
+    return records
+
+
 def _caption_matrix_experiments(source: dict, evidence: list[dict], paper_id: str, offset: int) -> list[dict]:
     """Read a parameter matrix only when its unique caption names the metric.
 
@@ -728,6 +891,8 @@ def _caption_matrix_experiments(source: dict, evidence: list[dict], paper_id: st
 
 def _canonical_metric(metric: str) -> str:
     clean = _norm(metric)
+    if re.fullmatch(r"classification accurac(?:y|ies)", clean):
+        return "accuracy"
     top_k = re.fullmatch(r"top[- ]?(\d+)\s+(?:(?:test|validation|classification)\s+)?(error|err\.?|accuracy)", clean)
     if top_k:
         return f"top{top_k[1]}_{'error' if top_k[2].startswith('err') else top_k[2]}"

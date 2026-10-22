@@ -30,7 +30,53 @@ def _has_number(value: str, source: str) -> bool:
                for match in _CLAIM_NUMBER.finditer(numeric_text(source)))
 
 
-def numeric_claim_gaps(statement: str, quotes: list[dict], verdict: str = "supported") -> list[str]:
+def _table_binding_gap(statement: str, quotes: list[dict], verdict: str, evidence: list[dict]) -> bool:
+    """Veto row/column swaps in the existing coordinate-backed dataset grid.
+
+    Only selected literal header/row quotations can establish membership. Full
+    source text is used to read cell boundaries, never as an uncited quotation.
+    This is not a dataset-role proof, a metric proof or a semantic entailment
+    engine; an unhandled/multiple binding must abstain rather than guess.
+    """
+    from .analysis import _dataset_result_cell
+    from .grounding import quote_matches_source
+
+    tables = [entry for entry in evidence if entry.get("table_structure") == "caption_bounded_dataset_grid"
+              and any(q.get("id") == entry["id"] for q in quotes)]
+    if not tables:
+        return False
+    requested = re.sub(r"\b(?:Table|Tab\.?)\s+[A-Z]?\d+(?:\.\d+)*\b", "", statement, flags=re.I)
+    percentages = re.findall(r"(?<![\w.])(" + NUMBER_PATTERN + r")\s*[%％]", numeric_text(requested))
+    values = {decimal_number(value) for value in percentages} if percentages else {
+        decimal_number(match[1]) for match in _CLAIM_NUMBER.finditer(numeric_text(requested))}
+    bindings = []
+    for table in tables:
+        selected = [q["quote"] for q in quotes if q.get("id") == table["id"]]
+        lines = [line for line in table["text"].splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        parts = lambda line: [part.strip() for part in line.strip().strip("|").split("|")]
+        headers = parts(lines[0])
+        if not any(quote_matches_source(lines[0], q) for q in selected):
+            continue
+        columns = [i for i, label in enumerate(headers[1:], 1) if _has_identifier(label, statement)]
+        if len(columns) != 1:
+            continue
+        for line in lines[2:]:
+            cells = parts(line)
+            if (len(cells) != len(headers) or not _has_identifier(cells[0], statement)
+                    or not any(quote_matches_source(line, q) for q in selected)):
+                continue
+            cell = _dataset_result_cell(cells[columns[0]])
+            if cell is not None:
+                bindings.append(decimal_number(cell["value"]))
+    # Multiple physical sources may repeat the same cell. This veto does not
+    # merge stored evidence or infer that equal measurements are one experiment.
+    return not bindings or len(set(bindings)) != 1 or (verdict == "supported" and values != set(bindings))
+
+
+def numeric_claim_gaps(statement: str, quotes: list[dict], verdict: str = "supported", *,
+                       evidence: list[dict] | None = None) -> list[str]:
     """Return reasons to abstain from a numeric support/refutation judgment.
 
     Scope identifiers are checked for *both* verdicts: an experiment on another
@@ -88,7 +134,7 @@ def numeric_claim_gaps(statement: str, quotes: list[dict], verdict: str = "suppo
         reasons.append("原文含成对数值，尚未建立数值、指标列与括号内外协议的可靠对应，请查看原表人工确认。")
     directions = [
         (r"错误率|误差率|\berrors?\b|\berr\.", r"错误率|误差率|\berrors?\b|\berr\."),
-        (r"准确率|正确率|\baccuracy\b|\bacc\.", r"准确率|正确率|\baccuracy\b|\bacc\."),
+        (r"准确率|正确率|\baccurac(?:y|ies)\b|\bacc\.", r"准确率|正确率|\baccurac(?:y|ies)\b|\bacc\."),
     ]
     for claim_pattern, source_pattern in directions:
         if re.search(claim_pattern, statement, re.I) and not re.search(source_pattern, readable_text(source), re.I):
@@ -112,6 +158,8 @@ def numeric_claim_gaps(statement: str, quotes: list[dict], verdict: str = "suppo
             break
     if verdict == "supported" and any(not _has_number(match[1], source) for match in numbers):
         reasons.append("命题中的数值未全部出现在所引片段，不能确认完整支持。")
+    if _table_binding_gap(statement, quotes, verdict, evidence or []):
+        reasons.append("所引表格未建立命题模型行、数据集列与主结果数值的唯一对应，不能借用其他单元格或误差项。")
     variants = [r"\bbase\b|基础(?:版|模型)?", r"\bfast\b|快速(?:版|模型)?",
                 r"\bbig\b|大号", r"\blarge\b|大型", r"\bsmall(?:er)?\b|小型|较小"]
     declared = [pattern for pattern in variants if re.search(pattern, statement, re.I)]
