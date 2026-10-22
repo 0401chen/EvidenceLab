@@ -27,6 +27,7 @@ from .errors import DocumentError, ProviderError
 from .experiment_validation import (prepare_experiments, verify_pdf_measurements,
                                     machine_measurement_verified, prioritize_measurements)
 from .store import Store
+from .task_attribution import machine_task_verified
 
 VERSION = "0.1.0"
 MAX_FILE_BYTES = 32 * 1024 * 1024
@@ -44,6 +45,7 @@ class ScopeRequest(BaseModel):
 class QARequest(ScopeRequest):
     question: str = Field(min_length=1, max_length=4000)
     engine: Literal["local", "llm"] = "local"
+    model_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 
     @field_validator("question")
     @classmethod
@@ -56,6 +58,7 @@ class QARequest(ScopeRequest):
 class VerifyRequest(ScopeRequest):
     claim: str = Field(min_length=1, max_length=4000)
     engine: Literal["local", "llm"] = "local"
+    model_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 
     @field_validator("claim")
     @classmethod
@@ -67,6 +70,7 @@ class VerifyRequest(ScopeRequest):
 
 class ExtractionRequest(BaseModel):
     mode: Literal["rule", "llm"] = "rule"
+    model_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
     reparse: bool = False
     pages: list[int] | None = Field(default=None, min_length=1, max_length=25)
     max_results: int = Field(default=12, ge=1, le=30, strict=True)
@@ -190,6 +194,13 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if not cfg.llm_configured:
             raise HTTPException(503, "模型尚未配置。请在项目 .env 中设置 LLM_API_KEY 和 LLM_MODEL，然后重启服务；也可以使用本地证据检索。")
 
+    def selected_model(model_id):
+        require_llm()
+        try:
+            return cfg.provider_config() if model_id is None else cfg.provider_config(model_id)
+        except ProviderError as exc:
+            raise HTTPException(422, exc.public_message) from None
+
     def public_settings():
         result = cfg.public()
         for provider, state in app.state.provider_status.items():
@@ -225,7 +236,19 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     async def provider_call(fn, *args):
         try:
+            args = list(args)
+            config = args[-1] if args and isinstance(args[-1], dict) and "model" in args[-1] else None
+            if config is not None:
+                config = {**config, "_model_runs": []}
+                args[-1] = config
             result = await fn(*args)
+            if config is not None:
+                for item in result if isinstance(result, list) else [result]:
+                    item["model_id"] = config["model"]
+                    item["model_runs"] = config["_model_runs"]
+                    if any(r.get("compatibility_retry") for r in config["_model_runs"]):
+                        item.setdefault("notes" if isinstance(result, list) else "warnings", []).append(
+                            "服务商不支持response_format，已保留相同模型重试一次JSON指令模式；响应仍经过完整结构与来源校验。")
             # Offline/no-evidence answers do not verify service connectivity.
             if result and (isinstance(result, list) or result.get("mode") == "llm" and result.get("citations")):
                 app.state.provider_status["chat"] = {"status": "available", "message": "本次运行已有模型请求成功；后续请求仍可能失败。", "checked_at": now()}
@@ -465,6 +488,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             experiment["evidence_quotes"] = {}
         experiment.update(updates)
         experiment.pop("machine_verification", None)  # A manual edit is not a new machine audit.
+        experiment.pop("task_verification", None)
+        experiment.pop("task_label_zh", None)
         approved_ids = set(experiment.get("evidence_ids", []))
         if any(not set(ids).issubset(approved_ids) for ids in experiment.get("field_evidence", {}).values()):
             raise HTTPException(400, "字段证据必须同时列在该实验的原文证据中")
@@ -530,6 +555,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         from .analysis import extract_experiments
         from .providers import extract_llm
         paper = paper_or_404(paper_id)
+        model_config = selected_model(body.model_id) if body.mode == "llm" else None
         sources = paper["evidence"]
         if body.pages and max(body.pages) > paper["page_count"]:
             raise HTTPException(422, "提取页码超出当前文献页数；已有研究记录未修改。")
@@ -574,7 +600,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if body.mode == "llm":
             require_llm()
             experiments = await provider_call(extract_llm, sources, paper_id,
-                                              {**cfg.provider_config(), "max_results": body.max_results})
+                                              {**model_config, "max_results": body.max_results})
         else:
             experiments = await run_in_threadpool(extract_experiments, sources, paper_id)
         if not experiments:
@@ -642,7 +668,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             return grounded(await run_in_threadpool(answer_local, body.question, evidence), evidence)
         require_llm()
         if body.engine == "llm":
-            task_config = cfg.provider_config()
+            task_config = selected_model(body.model_id)
             result = grounded(await provider_call(answer_llm, body.question, evidence, task_config), evidence)
             if result.get("citations") and result.get("verdict") != "insufficient":
                 try:
@@ -654,7 +680,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                     # this to the answer's chosen rows discards table headers,
                     # captions and counter-evidence and repeats the same error.
                     check = grounded(await provider_call(verify_claim, claim_text or result["answer"], evidence,
-                                                         cfg.provider_config()), evidence)
+                                                         task_config), evidence)
                 except HTTPException as exc:
                     # Retain the already grounded answer when only the separate
                     # semantic check fails; its uncertainty must remain visible.
@@ -682,7 +708,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         evidence = store.evidence_for(ids)
         if body.engine == "llm":
             require_llm()
-        task_config = cfg.provider_config() if body.engine == "llm" else None
+        task_config = selected_model(body.model_id) if body.engine == "llm" else None
         result = grounded(await provider_call(verify_claim, body.claim, evidence, task_config), evidence)
         return result
 
@@ -747,8 +773,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         lines.extend(["## 实验矩阵", "", "|论文 / 实验|任务|方法|数据集|划分|指标|数值|单位|样本量|条件|证据|", "|---|---|---|---|---|---|---|---|---|---|---|"])
         for exp in report["experiments"]:
             conditions = "; ".join(f"{k}={v}" for k, v in exp.get("conditions", {}).items()) or "未报告"
-            lines.append("|" + "|".join(safe(v) for v in [paper_names[exp["paper_id"]] + " / " + exp["name"], exp.get("task"), exp.get("method"), exp.get("dataset"), exp.get("split"), exp.get("metric"), exp.get("value"), exp.get("unit"), exp.get("sample_size"), conditions, ", ".join(exp.get("evidence_ids", []))]) + "|")
-        lines.extend(["", "## 字段原文与复核", "", "以下引文用于定位字段来源；字面出现不能代替实验归属和语义复核。未报告字段没有被补齐。", ""])
+            lines.append("|" + "|".join(safe(v) for v in [paper_names[exp["paper_id"]] + " / " + exp["name"], ((exp.get("task_label_zh") + " / " + exp["task"]) if exp.get("task_label_zh") and exp.get("task") else exp.get("task") or "任务尚未自动确认"), exp.get("method"), exp.get("dataset"), exp.get("split"), exp.get("metric"), exp.get("value"), exp.get("unit"), exp.get("sample_size"), conditions, ", ".join(exp.get("evidence_ids", []))]) + "|")
+        lines.extend(["", "## 字段原文与复核", "", "以下引文用于定位字段来源；字面出现不能代替实验归属和语义复核。任务尚未自动确认表示尚未建立逐实验来源归属，不表示论文没有报告任务。其他未确认字段没有被补齐。", ""])
         for exp in report["experiments"]:
             review_label = ("测量字段机器核验通过；协议未核验；未进行人工审核" if machine_measurement_verified(exp)
                             else "需人工复核" if exp.get("review_required", True) else "请确认复核记录")
@@ -757,6 +783,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 check = exp["machine_verification"]
                 lines.extend(["测量字段机器核验通过（未进行人工审核）：方法、数据集、指标、主值及单位与原始 PDF 行列/表注相符。实验协议与统计结论不在认证范围。",
                               f"完整结果单元格：{safe(check['raw_cell'])}；PDF SHA256：{check['pdf_sha256']}。", ""])
+            if machine_task_verified(exp, report["evidence"]):
+                lines.extend(["任务归属机器核验通过（独立于测量范围）：" + safe(exp.get("task_label_zh") or exp["task"]) + "；不认证完整实验协议或跨论文可比性。", ""])
             for field, references in exp.get("evidence_quotes", {}).items():
                 for ref in references:
                     lines.extend([f"- {safe(field)} · {safe(ref.get('id'))}", "", "> " + str(ref.get("quote", "")).replace("\n", "\n> "), ""])

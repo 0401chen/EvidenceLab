@@ -17,6 +17,7 @@ def test_comparison_workflow_records_all_four_actual_stages(experiment_factory, 
     experiments = [*extract_experiments(evidence, "paper-a"), *extract_experiments(evidence, "paper-b")]
     result = run_comparison(experiments, evidence)
     assert len(result["traces"]) == 4
+    assert [trace["agent"] for trace in result["traces"]] == ["实验整理 Agent", "条件对齐 Agent", "差异分析 Agent", "证据核验 Agent"]
     assert all(trace["status"] == "completed" for trace in result["traces"])
     assert result["comparisons"][0]["verdict"] == "different"
     assert set(result["comparisons"][0]["evidence_ids"]) <= {e["id"] for e in evidence}

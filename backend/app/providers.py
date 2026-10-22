@@ -19,6 +19,7 @@ from .errors import ProviderError
 from .grounding import (NUMBER_PATTERN, compact_text, decimal_number, number_in_text,
                         numeric_text, quote_matches_source, readable_text)
 from .research_guard import numeric_claim_gaps
+from .model_catalog import transport_options
 
 
 _SYSTEM = """你是科研文献证据助手。仅依据提供的原文数据回答，中文输出。
@@ -58,27 +59,46 @@ async def _chat_json(messages: list[dict], config: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     if config.get("api_key"):
         headers["Authorization"] = f"Bearer {config['api_key']}"
-    payload = {"model": config["model"], "messages": messages, "temperature": 0,
-               "max_tokens": 6500, "response_format": {"type": "json_object"}}
+    payload = {"model": config["model"], "messages": messages, **transport_options(config["model"])}
     try:
         async with httpx.AsyncClient(timeout=config["timeout"], follow_redirects=False) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
+            runs = config.get("_model_runs")
+            if isinstance(runs, list):
+                current_run = {"requested_model": config["model"], "http_status": response.status_code}
+                runs.append(current_run)
             # Some compatible providers do not implement response_format.
             if response.status_code in {400, 422}:
                 try:
                     error_text = str(response.json().get("error", "")).lower()
                 except (ValueError, AttributeError):
                     error_text = ""
-                if "response_format" in error_text or "json_object" in error_text:
+                if "response_format" in payload and ("response_format" in error_text or "json_object" in error_text):
                     payload.pop("response_format")
                     response = await client.post(endpoint, headers=headers, json=payload)
+                    if isinstance(runs, list):
+                        current_run = {"requested_model": config["model"], "http_status": response.status_code,
+                                       "compatibility_retry": "without_response_format"}
+                        runs.append(current_run)
             if response.status_code >= 400:
                 if response.status_code in {401, 403}:
                     raise ProviderError("authentication", "模型服务拒绝认证，请检查服务器 API 密钥与访问权限。")
                 if response.status_code == 429:
                     raise ProviderError("quota", "模型服务请求额度或速率已达上限，请稍后重试。")
+                if response.status_code in {400, 404, 422}:
+                    raise ProviderError("model_compatibility", "所选模型、参数或JSON格式不受当前服务商支持；未切换模型，请检查服务商权限与兼容性。")
                 raise ProviderError("http_error", f"模型服务请求失败（HTTP {response.status_code}），请检查地址、模型与服务状态。")
             body = response.json()
+            if isinstance(runs, list):
+                current_run["response_model"] = body.get("model")
+                usage = body.get("usage")
+                if isinstance(usage, dict):
+                    current_run["usage"] = {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                                          if type(usage.get(k)) is int and usage[k] >= 0}
+            if body.get("model") and body["model"] != config["model"]:
+                # Providers may report a dated version of the requested family.
+                if not str(body["model"]).startswith(config["model"] + "-"):
+                    raise ProviderError("model_mismatch", "服务商返回的模型与所选型号不一致，本次响应已拒绝。")
             choice = body["choices"][0]
             if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
                 raise ProviderError("output_format", "模型响应格式无效，缺少文本消息对象。")

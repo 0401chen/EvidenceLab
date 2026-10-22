@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .errors import ProviderError
 from .grounding import quote_matches_source
+from .task_attribution import infer_task, attach_task, machine_task_verified
 
 
 def prepare_experiments(records: list[dict], paper: dict, evidence: list[dict]) -> list[dict]:
@@ -71,15 +72,19 @@ def _digest(value) -> str:
 
 def _measurement_fingerprint(item: dict) -> str:
     # Candidate IDs change on save; scientific fields and their provenance do not.
-    return _digest({field: item.get(field) for field in
+    payload = {field: item.get(field) for field in
                     (*_MEASUREMENT_FIELDS, *_PROTOCOL_FIELDS, "paper_id", "table_context",
-                     "evidence_ids", "field_evidence", "evidence_quotes", "extraction_method")})
+                     "evidence_ids", "field_evidence", "evidence_quotes", "extraction_method")}
+    if "task_verification" in item:
+        payload["task_verification"] = item["task_verification"]
+    return _digest(payload)
 
 
 def machine_measurement_verified(item: dict, evidence: list[dict] | None = None) -> bool:
     check = item.get("machine_verification") or {}
     return (check.get("status") == "verified" and check.get("version") == "pdf_measurement_v1"
             and check.get("record_sha256") == _measurement_fingerprint(item)
+            and ("task_verification" not in item or machine_task_verified(item, evidence))
             and (evidence is None or check.get("evidence_sha256") == _digest(
                 [e for e in evidence if e.get("paper_id") == item.get("paper_id")])))
 
@@ -174,7 +179,8 @@ def verify_pdf_measurements(records: list[dict], paper: dict, evidence: list[dic
             try:
                 require(document is not None, failure)
                 require(item.get("extraction_method") == "rule", "unsupported_extraction_path")
-                require(not any(item.get(f) for f in _PROTOCOL_FIELDS), "protocol_outside_verified_scope")
+                require(not any(item.get(f) for f in _PROTOCOL_FIELDS if f != "task")
+                        and (not item.get("task") or machine_task_verified(item, own)), "protocol_outside_verified_scope")
                 prepare_experiments([item], paper, own)
                 context = item.get("table_context") or {}
                 table = known.get(context.get("table_evidence_id"), {})
@@ -267,6 +273,20 @@ def verify_pdf_measurements(records: list[dict], paper: dict, evidence: list[dic
                         left = header_boxes[1][0] - 8 if j == 1 else (centres[j - 1] + centres[j]) / 2
                         right = (centres[j] + centres[j + 1]) / 2 if j + 1 < len(headers) else table["bbox"][2] + .02
                         require(left <= centre < right, "raw_column_alignment_conflict")
+                task = infer_task(item, own)
+                if task:
+                    try:
+                        for ref in task["quotes"]:
+                            support_matches(known[ref["id"]])
+                    except ValueError:
+                        # Supplemental task failure cannot certify that task or
+                        # erase an otherwise valid narrow measurement check.
+                        require(not item.get("task"), "task_source_not_in_pdf")
+                    else:
+                        if not item.get("task"):
+                            attach_task(item, task, own)
+                if machine_task_verified(item, own):
+                    check["unverified_fields"] = [f for f in _PROTOCOL_FIELDS if f != "task"]
                 check.update(status="verified", reason="raw_pdf_measurement_bound",
                              pdf_sha256=expected_sha256, evidence_sha256=evidence_hash,
                              record_sha256=_measurement_fingerprint(item),

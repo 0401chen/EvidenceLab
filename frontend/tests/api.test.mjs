@@ -6,7 +6,7 @@ import ts from 'typescript';
 // Compile with the project's existing TypeScript dependency; no extra test runtime.
 const source=await readFile(new URL('../src/api.ts',import.meta.url),'utf8');
 const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
-const {ApiError,defaultEngine,engineIsAvailable,isCancelled,post,qaDisplayAnswer,request}=await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const {ApiError,DEFAULT_MODEL_ID,defaultEngine,defaultModelId,engineIsAvailable,isCancelled,post,qaDisplayAnswer,request}=await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 const originalFetch=globalThis.fetch;
 afterEach(()=>{globalThis.fetch=originalFetch;});
 
@@ -162,4 +162,29 @@ test('QA and verification menus only contain the two supported engines',async()=
  assert.match(options,/大模型增强问答/);
  assert.match(options,/模型语义核验/);
  assert.doesNotMatch(app,/llm_tasks|TaskRequirements/);
+});
+
+
+test('model selection payloads preserve server-bound model IDs in all three operations',async()=>{
+ const calls=[];
+ globalThis.fetch=async(url,init)=>{calls.push({url,body:JSON.parse(init.body)});return Response.json({model_id:JSON.parse(init.body).model_id});};
+ for(const path of ['/qa','/verify','/papers/synthetic/extract']){
+  const body={paper_ids:['synthetic'],model_id:'gpt-4.1-mini',...(path.endsWith('/extract')?{mode:'llm'}:{engine:'llm'})};
+  assert.equal((await post(path,body)).model_id,'gpt-4.1-mini');
+  assert.equal(calls.at(-1).body.model_id,body.model_id);
+  assert.ok(!('api_key' in calls.at(-1).body)&&!('base_url' in calls.at(-1).body));
+ }
+ assert.equal(calls.length,3);
+});
+
+
+test('default model is explicit gpt-4o-mini and respects a configured override',()=>{
+ assert.equal(DEFAULT_MODEL_ID,'gpt-4o-mini');
+ assert.equal(defaultModelId(),'gpt-4o-mini');
+ assert.equal(defaultModelId([]),'gpt-4o-mini');
+ assert.equal(defaultModelId([{id:'gpt-4.1-nano',default:true,enabled:true}]),'gpt-4.1-nano');
+});
+test('unavailable default never silently selects another enabled model',()=>{
+ assert.equal(defaultModelId([{id:'gpt-4o-mini',default:true,enabled:false},{id:'gpt-4.1-mini',default:false,enabled:true}]),'gpt-4o-mini');
+ assert.equal(defaultModelId([{id:'gpt-4.1-mini',default:false,enabled:true}]),'gpt-4o-mini');
 });
